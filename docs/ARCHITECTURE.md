@@ -1,0 +1,151 @@
+# UNet++ hairline crack segmentation architecture
+
+Organization follows the Swin U-Net, FiLM U-Net and multi-decoder U-Net
+projects (configs, src, scripts, slurm, docs). The data pipeline, augmentation
+library, loss, metrics, figures and training loop are those of the other
+hairline trainers; the network is new. It is not conditioned on the ground
+sampling distance.
+
+| Module | Responsibility |
+| --- | --- |
+| `src/unetpp/common.py` | Shared imports, constants (default encoder), default paths, random seeds |
+| `src/unetpp/gsd.py` | GSD table (`pattern,gsd_mm_per_px`) and per-GSD groups, for the data pipeline and the reports |
+| `src/unetpp/augmentations.py` | Reference augmentation, extended library, label safety, presets |
+| `src/unetpp/data.py` | Image/mask pairing, dataset with GSD bookkeeping, augmentation preview, batching |
+| `src/unetpp/models.py` | `UNetPlusPlus` (smp encoder and nested decoder, stems, deep supervision), EMA, checkpoint reconstruction |
+| `src/unetpp/losses.py` | BCE, Tversky, clDice, focal loss, with deep-supervision terms |
+| `src/unetpp/evaluation.py` | Threshold sweeps, tiled inference, tolerant metrics, predictions |
+| `src/unetpp/plots.py` | Epoch curves and final evaluation figures/tables |
+| `src/unetpp/training.py` | Argument parsing, optimizer/scheduler, training/validation, resume |
+| `src/unetpp/self_test.py` | The trainer's built-in checks (`--self-test`) |
+| `scripts/train.py` | TOML defaults and training CLI |
+| `scripts/encoder_weights.py` | Cache the pretrained encoder, or check that it is cached |
+| `slurm/train_unetpp.sbatch` | ASL GPU allocation and execution |
+
+`augmentations.py`, `data.py` and `gsd.py` are unchanged copies of the
+multi-decoder U-Net project's files.
+
+## The network
+
+```text
+image ──┬─ encoder (ConvNeXt or EfficientNet) ── features at 1/2*, 1/4, 1/8, 1/16, 1/32
+        ├─ 1/2-scale stem, ConvNeXt only ─────── * the 1/2-scale features ConvNeXt lacks
+        └─ hairline stem (black-hat / top-hat) ── features at 1/1
+
+ scale   encoder     nested UNet++ decoder (smp)
+ 1/2     feature ──▶ X(0,1) ──▶ X(0,2) ──▶ X(0,3) ──▶ X(0,4) ──▶ last node 1/1 ──▶ 3x3 conv ──▶ crack
+ 1/4     feature ──▶ X(1,1) ──▶ X(1,2) ──▶ X(1,3) ─┘                ▲
+ 1/8     feature ──▶ X(2,1) ──▶ X(2,2) ─┘                    hairline stem
+ 1/16    feature ──▶ X(3,1) ─┘
+ 1/32    feature ─┘
+                     └── 1x1 outputs on X(0,1), X(0,2), X(0,3): deep supervision
+```
+
+Every node X(i,j) upsamples the node below it and concatenates all earlier
+nodes of its own row, which is what distinguishes UNet++ from U-Net: the skip
+connections pass through convolutions instead of being copied.
+
+- **Encoder** (`--encoder`): any encoder of
+  [segmentation_models_pytorch](https://github.com/qubvel-org/segmentation_models.pytorch),
+  ImageNet-pretrained. `tu-<name>` is a timm model. The default is
+  `tu-convnext_tiny` (27.8 M parameters); `efficientnet-b4` (17.5 M) is the
+  EfficientNet to run next to it. The image is normalised inside the model
+  with the statistics the encoder was pretrained with, so the model is called
+  with RGB in [0, 1].
+- **Decoder**: smp's `UnetPlusPlusDecoder`, 256, 128, 64, 32 and 16 channels
+  from 1/16 to 1/1 scale, scSE attention in every node, then smp's 3x3 output
+  convolution. Built and initialised as `smp.UnetPlusPlus` builds it.
+- **1/2-scale stem, ConvNeXt only.** ConvNeXt downsamples four times in its
+  first layer and has no features at 1/2 scale. smp marks that scale with a
+  feature of zero channels, and the forward pass of `smp.UnetPlusPlus` fails on
+  it. Two 3x3 convolutions on the image, the first with stride 2
+  (`--half-channels`, 48), trained from scratch, supply the top row of the
+  decoder. EfficientNet has 1/2-scale features of its own and gets no stem.
+- **Hairline stem**, as in the other trainers. In smp the last node upsamples
+  from 1/2 scale without a skip connection. Here a full-resolution stem (two
+  3x3 convolutions on the image and on fixed black-hat and top-hat responses)
+  is the skip of that node. `--no-line-prior` drops the thin-line channels,
+  `--no-hairline-stem` the whole stem.
+- **Deep supervision**, as in the UNet++ paper: a 1x1 output on each of
+  X(0,1), X(0,2) and X(0,3), upsampled to full size and trained on the crack
+  mask. `--no-deep-supervision` removes them. They are used in training only.
+
+With an EfficientNet encoder, `--no-hairline-stem` and `--no-deep-supervision`
+the network is `smp.UnetPlusPlus` itself; the tests load its weights into smp's
+model and compare the outputs.
+
+| Network | Parameters |
+| --- | --- |
+| UNet++ on `tu-convnext_tiny`, default | 35.1 M |
+| UNet++ on `efficientnet-b4`, default | 20.9 M |
+| Multi-decoder U-Net on ResNet-34, three decoders | 31.0 M |
+
+## Loss
+
+```text
+loss = L(output, mask)                                    BCE + Tversky + clDice
+     + sum over X(0,1..3) of  w_k * R(deep output k, mask)   BCE + Tversky
+```
+
+`L` is the reference loss of the other projects and `R` its region term.
+`w_k` is `--aux-weights` (0.2 for each). `--loss focal` replaces BCE + Tversky
+by the focal loss in both.
+
+`training_history.csv` records the whole objective (`train_loss`) and the part
+of the network output (`train_output_loss`, the terms `val_loss` has).
+
+## Training settings
+
+The settings are those of the other CNN trainers, so that the runs differ in
+the network only: AdamW, learning rate 3e-4 with the pretrained encoder at a
+tenth of it, weight decay 1e-4, two warm-up epochs and cosine decay, EMA
+weights, mixed precision, gradient clipping at 1, crops of 256 px, batch 12,
+80 epochs with early stopping after 15 epochs without improvement. The stems,
+the decoder and the outputs train at the full rate. `--drop-path-rate` (0.1)
+is the stochastic depth of a timm encoder; smp's own EfficientNets have theirs
+built in.
+
+## Augmentation
+
+The augmentation library of the earlier trainers is used whole: the reference
+augmentation plus 63 registered operations (mixing, synthetic cracks and distractors,
+rescaling, warps, orthomosaic artefacts, photometric, weather, blur, noise,
+compression, occlusion), RandAugment, the label-safety check and the
+augmentation preview. The default preset is `all`: every operation at
+probability 0.05 and magnitude 0.75 on top of the reference augmentation.
+
+Seven of the operations (mixup, piecewise-affine, ghosting, solarize, rain,
+zoom-blur, glass-blur) can harm crack labels and are left out of the `light`,
+`medium` and `heavy` presets; `all` includes them. `--aug-preset heavy` is the
+strongest preset without them, and `--aug-preset reference` is the
+augmentation the Swin and FiLM U-Net runs used. The table of probabilities is
+in `python scripts/train.py --help`.
+
+## The GSD table
+
+The network has no GSD input. `configs/gsd.csv` (the pixel size of each
+source) is used by the data pipeline only: the mixing augmentations (mosaic,
+CutMix, MixUp, copy-paste) combine tiles of one source and one GSD, the
+augmentation preview shows the GSD of each tile, and the test metrics are also
+reported per GSD value. Without `--gsd-csv` every tile counts as unknown and
+training is otherwise the same.
+
+## Checkpoints
+
+`last.pt` and `best.pt` are written to a temporary file and renamed. `best.pt`
+stores the architecture name and arguments (encoder, decoder options, stems,
+deep supervision), the GSD table and the augmentation configuration, and
+`unetpp.models.load_model_from_checkpoint` rebuilds the network from them
+without downloading anything. `--init-weights` and `--resume` need the same
+network as the checkpoint and stop with the differing options otherwise.
+
+The dataset stays outside the repository and is supplied by absolute path.
+Each fresh job writes into its own `runs/` directory. Resume uses the same
+directory with `RESUME=1`. Do not run concurrent jobs into one output folder.
+
+## Inference
+
+There is no full-orthomosaic inference for this model yet. A model loaded with
+`load_model_from_checkpoint` is called as `model(images)` with RGB in [0, 1]
+and a height and width that are multiples of 32, and returns the crack logits;
+`checkpoint["optimal_threshold"]` is the threshold calibrated on validation.

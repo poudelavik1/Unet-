@@ -1,0 +1,6 @@
+numpy
+opencv-python-headless
+pillow
+matplotlib
+segmentation-models-pytorch==0.5.0
+timm>=1.0
