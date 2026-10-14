@@ -36,9 +36,13 @@ print('GPU:', torch.cuda.get_device_name(0))
 # Verify actual CUDA execution, not just device discovery.
 print('CUDA tensor check:', (torch.ones(1, device='cuda') + 1).item())
 PY
+# An evaluation-only job keeps the training job's records and writes its own beside them.
+record=""
+[[ "${EVALUATE_ONLY:-0}" != 1 ]] || record="evaluate_only_"
 # The folder is a Git checkout only if it was cloned rather than copied to the server.
-git rev-parse HEAD > "$OUTPUT_DIR/git_commit.txt" 2>/dev/null || echo "not a Git checkout" > "$OUTPUT_DIR/git_commit.txt"
-python -m pip freeze > "$OUTPUT_DIR/packages.txt"
+git rev-parse HEAD > "$OUTPUT_DIR/${record}git_commit.txt" 2>/dev/null \
+    || echo "not a Git checkout" > "$OUTPUT_DIR/${record}git_commit.txt"
+python -m pip freeze > "$OUTPUT_DIR/${record}packages.txt"
 args=("$DATASET" --output "$OUTPUT_DIR")
 [[ -z "${EPOCHS:-}" ]] || args+=(--epochs "$EPOCHS")
 [[ -z "${BATCH_SIZE:-}" ]] || args+=(--batch-size "$BATCH_SIZE")
@@ -58,7 +62,9 @@ if [[ -n "${TRAIN_ARGS:-}" ]]; then
     read -ra extra <<< "$TRAIN_ARGS"           # further trainer options: "--no-hairline-stem --no-deep-supervision"
     args+=("${extra[@]}")
 fi
-if [[ "${RESUME:-0}" == 1 ]]; then
+if [[ "${EVALUATE_ONLY:-0}" == 1 ]]; then
+    args+=(--evaluate-only)
+elif [[ "${RESUME:-0}" == 1 ]]; then
     test -f "$OUTPUT_DIR/last.pt" || { echo "Resume checkpoint missing" >&2; exit 1; }
     args+=(--resume)
 fi

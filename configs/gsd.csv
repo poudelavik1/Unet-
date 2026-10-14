@@ -9,6 +9,10 @@ pattern,gsd_mm_per_px
 ^F4_,1.8787
 ^F6_,1.8735
 ^F8_,1.9174
+# RAMA8 faces 3, 5 and 7: pixel size of the image in 20260710_RAMA8_FACE 3/5/7.dxf (drawn in metres).
+^F3_,1.8867
+^F5_,1.8767
+^F7_,1.8901
 # RAMA8 east and west faces: pixel size of the images in the 20260704 crack mapping DXFs.
 ^RAMA8_EAST-,2.5
 ^RAMA8_WEST-,1.9056

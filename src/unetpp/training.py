@@ -54,6 +54,19 @@ by the binary focal loss everywhere. ``training_history.csv`` has the whole
 objective as ``train_loss`` and the part of the network output as
 ``train_output_loss`` (the terms ``val_loss`` has).
 
+Thresholds: the threshold of the network output is calibrated on validation
+with ``--select-metric`` (the 2-px tolerant F1) on a grid from 0.01 to 0.99.
+Besides that shared threshold, every source family gets its own, if it has
+at least ``--source-threshold-min-images`` (10) validation images; a smaller
+source keeps the shared one. On the first UNet++ run the shared threshold
+(0.875) was set by the benchmark photos, whose cracks are thick and
+contrasted, while the orthomosaic tiles scored best at the bottom of the
+grid (0.05), 0.05 to 0.09 tolerant F1 higher than at 0.875. The test
+metrics are reported both ways: at the shared threshold as before, and under
+``with_source_thresholds`` with every source at its own. ``best.pt`` stores
+both (``optimal_threshold``, ``source_thresholds`` and their ``_tta``
+variants), so a detector can use the threshold of the source it is run on.
+
 GSD table (``--gsd-csv``, optional): the ground sampling distance (mm per
 pixel) of each source, as a CSV with the columns ``pattern,gsd_mm_per_px``.
 ``pattern`` is a regular expression searched in the image file name (for
@@ -231,7 +244,10 @@ Outputs, in ``unetpp_hairline_output`` by default:
 requested. ``test_predictions/`` holds, for every saved test image, the
 probability map and the overlay of the network output. ``best.pt`` also
 stores the architecture with its encoder and decoder options, the GSD table
-and the augmentation configuration.
+and the augmentation configuration. ``--evaluate-only`` writes its metrics
+to ``test_metrics_evaluate_only.json`` and leaves the run's other files as
+they are, so an earlier run can be scored with the per-source thresholds
+without training again.
 
 ``--self-test`` checks the network (against ``smp.UnetPlusPlus``) and the
 loss, and the alignment, binary labels and GSD bookkeeping of every
@@ -254,7 +270,10 @@ from .data import (
 )
 from .models import ARCHITECTURES, ModelEMA, different_arguments
 from .losses import FocalCrackLoss, HairlineCrackLoss
-from .evaluation import ThresholdSweep, at_threshold, basic_metrics, evaluate, metrics_from_counts, prediction_writer
+from .evaluation import (
+    ThresholdSweep, at_threshold, basic_metrics, counts_at_indices, evaluate, metrics_from_counts, prediction_writer,
+    source_threshold_indices,
+)
 from .plots import save_evaluation_tables, save_plots
 
 # --------------------------------------------------------------------------- #
@@ -282,6 +301,9 @@ def warmup_cosine(total_steps: int, warmup_steps: int, minimum_ratio: float):
         progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
         return minimum_ratio + (1 - minimum_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
     return factor
+
+
+MODE_NAMES = {"no_tta": "no TTA", "tta": "flip TTA"}
 
 
 def json_safe(value):
@@ -414,8 +436,9 @@ def parse_arguments():
                              "The run itself is fresh (new schedule, EMA and history); not used when --resume "
                              "continues from last.pt")
     parser.add_argument("--evaluate-only", action="store_true",
-                        help="No training: evaluate <output>/best.pt on validation and test and write the "
-                             "figures, curves and confusion matrices to <output>/plots (other files untouched)")
+                        help="No training: evaluate <output>/best.pt on validation and test, write the "
+                             "metrics to <output>/test_metrics_evaluate_only.json and the figures, curves and "
+                             "confusion matrices to <output>/plots (other files untouched)")
     parser.add_argument("--self-test", action="store_true",
                         help="Run the built-in checks (network and loss, augmentation alignment "
                              "and GSD bookkeeping) on a temporary dummy dataset, then exit")
@@ -499,6 +522,9 @@ def parse_arguments():
                         help="Regex on validation file names defining the target domain (model selection "
                              r"and threshold), e.g. '^EH\d' for the EH104 tiles only. Default: empty = "
                              "all validation data, every source in the dataset")
+    parser.add_argument("--source-threshold-min-images", type=int, default=10,
+                        help="A source family gets its own validation-calibrated threshold if it has at least "
+                             "this many validation images; smaller ones keep the shared threshold")
     parser.add_argument("--no-tta", action="store_true", help="Disable flip TTA for calibration/test")
     parser.add_argument("--eval-batch-megapixels", type=float, default=2.0,
                         help="An evaluation batch holds at most this many megapixels "
@@ -780,7 +806,10 @@ def main():
             args.false_positive_weight, args.false_negative_weight,
             args.skeleton_iterations, args.aux_weights, args.label_tolerance,
         )
-    thresholds = np.round(np.arange(0.05, 0.951, 0.025), 3)
+    # 0.05 to 0.95 in steps of 0.025, and 0.01 steps beyond: on the first run the orthomosaic tiles scored
+    # best at 0.05 and the benchmark photos at 0.95, the ends of the grid of the earlier trainers.
+    thresholds = np.round(np.concatenate((np.arange(0.01, 0.045, 0.01), np.arange(0.05, 0.951, 0.025),
+                                          np.arange(0.96, 0.995, 0.01))), 3)
     sweep = ThresholdSweep(thresholds, args.tolerance, len(domains), device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters()) / 1e6
     print(f"Device: {device} | AMP: {use_amp} | parameters: {parameter_count:.1f} M | "
@@ -979,7 +1008,8 @@ def main():
     model.eval()
     print(f"\nBest epoch {checkpoint['epoch']} ({args.select_metric} {checkpoint['best_val_score']:.4f}).")
     use_tta = not args.no_tta
-    calibration, evaluation = {}, {}
+    calibration, evaluation, source_indices = {}, {}, {}
+    validation_images = {domain_index[name]: count for name, count in Counter(families["val"]).items()}
     for tta in sorted({False, use_tta}):
         evaluate(model, calibration_loader, device, sweep, use_amp, tta=tta, **tiling)
         validation_counts = sweep.count_array(target_ids)
@@ -996,6 +1026,23 @@ def main():
             print(f"Validation-calibrated threshold ({'flip TTA' if tta else 'no TTA'}): {thresholds[index]:.3f}")
         calibration[tta] = (index, metrics)
         evaluation["tta" if tta else "no_tta"] = {"threshold_index": index, "val": validation_counts}
+        # Every source's own threshold, besides the shared one; evaluation only reuses those of best.pt.
+        stored_sources = checkpoint.get("source_thresholds_tta" if tta else "source_thresholds")
+        calibrated = not (args.evaluate_only and stored_sources)
+        if not calibrated:
+            source_indices[tta] = {domain_index[name]: int(np.argmin(np.abs(thresholds - value)))
+                                   for name, value in stored_sources.items() if name in domain_index}
+        else:
+            source_indices[tta] = source_threshold_indices(sweep, target_ids, args.select_metric, validation_images,
+                                                           args.source_threshold_min_images, index)
+        print(f"{'Own threshold per source' if calibrated else 'Thresholds per source stored in best.pt'} "
+              f"({'flip TTA' if tta else 'no TTA'}), validation {args.select_metric} at the shared "
+              f"{thresholds[index]:.3f} -> at its own:")
+        for domain, own in sorted(source_indices[tta].items(), key=lambda item: domains[item[0]]):
+            source_metrics = metrics_from_counts(sweep.count_array([domain]))[args.select_metric]
+            few = calibrated and validation_images.get(domain, 0) < args.source_threshold_min_images
+            print(f"    {domains[domain]:28s} {source_metrics[index]:.3f} -> {source_metrics[own]:.3f} "
+                  f"at {thresholds[own]:.3f}" + (" (too few images: the shared threshold)" if few else ""))
     if not args.evaluate_only:
         with (args.output / "val_threshold_sweep.csv").open("w", newline="", encoding="utf-8") as handle:
             sweep_writer = csv.writer(handle)
@@ -1011,6 +1058,8 @@ def main():
             str(tta): {name: calibration[tta][1][name].tolist() for name in METRIC_NAMES} for tta in calibration
         }
         checkpoint["thresholds"] = thresholds.tolist()
+        for key, tta in (("source_thresholds", False), ("source_thresholds_tta", use_tta)):
+            checkpoint[key] = {domains[domain]: float(thresholds[own]) for domain, own in source_indices[tta].items()}
         save_checkpoint(checkpoint, best_path)
 
     results = {
@@ -1036,13 +1085,34 @@ def main():
         per_gsd = {gsd_labels[group]: {"images": gsd_group_ids.count(group),
                                        **at_threshold(gsd_sweep.metrics([group]), index)}
                    for group in sorted(set(gsd_group_ids))}
+        # Each source at its own validation-calibrated threshold; a source without one at the shared threshold.
+        own = {d: source_indices[tta].get(d, index) for d in sorted(set(test_set.domain_ids))}
+        with_source_thresholds = {
+            **at_threshold(metrics_from_counts(counts_at_indices(sweep, own)), 0),
+            "per_source": {domains[d]: {"threshold": float(thresholds[i]), **at_threshold(sweep.metrics([d]), i)}
+                           for d, i in own.items()},
+        }
         results[mode] = {
             "threshold": float(thresholds[index]), "loss": test_loss,
             **at_threshold(sweep.metrics(), index), "per_source": per_source, "per_gsd": per_gsd,
+            "with_source_thresholds": with_source_thresholds,
         }
-    if not args.evaluate_only:  # an evaluation-only run never overwrites the training run's files
-        (args.output / "test_metrics.json").write_text(json.dumps(results, indent=2))
+    # An evaluation-only run never overwrites the training run's files.
+    metrics_name = "test_metrics_evaluate_only.json" if args.evaluate_only else "test_metrics.json"
+    (args.output / metrics_name).write_text(json.dumps(results, indent=2))
     print("Test:", json.dumps(results, indent=2))
+    metric = args.select_metric
+    for mode in ("no_tta", "tta"):
+        if mode not in results:
+            continue
+        shared, own = results[mode], results[mode]["with_source_thresholds"]
+        print(f"Test {metric} ({MODE_NAMES[mode]}), at the shared threshold {shared['threshold']:.3f} -> "
+              f"at each source's own:")
+        for name in sorted(own["per_source"]):
+            print(f"    {name:28s} {shared['per_source'][name][metric]:.3f} -> {own['per_source'][name][metric]:.3f} "
+                  f"at {own['per_source'][name]['threshold']:.3f}")
+        print(f"    {'all sources pooled':28s} {shared[metric]:.3f} -> {own[metric]:.3f}")
+    print(f"Test metrics in {args.output / metrics_name}.")
 
     # ---------------- Tables and figures ---------------- #
     plot_folder = args.output / "plots"
@@ -1056,7 +1126,7 @@ def main():
 
 
 __all__ = [
-    'parameter_groups', 'warmup_cosine', 'json_safe', 'save_checkpoint', 'open_epoch_log',
+    'parameter_groups', 'warmup_cosine', 'MODE_NAMES', 'json_safe', 'save_checkpoint', 'open_epoch_log',
     'initial_weights', 'flag_name', 'REFERENCE_AUGMENTATION_ARGUMENTS',
     'resolve_augmentation', 'parse_arguments', 'check_augmentation_arguments', 'main',
 ]

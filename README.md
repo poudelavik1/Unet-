@@ -49,6 +49,11 @@ convolution are smp's. Three things are added, each with a switch:
 With EfficientNet and the last two switched off, the network is
 `smp.UnetPlusPlus` itself, weight for weight.
 
+Every source family also gets its own validation-calibrated threshold next to
+the shared one: on the first run the facade tiles scored best near 0.05 while
+the shared threshold was 0.875. Both are reported and stored in `best.pt`
+([details](docs/ARCHITECTURE.md#thresholds)).
+
 ## Run locally
 
 ```bash
@@ -89,7 +94,7 @@ ENCODER=efficientnet-b4 bash scripts/setup_conda.sh
 ```bash
 cd ~/unetpp
 git pull --ff-only
-bash scripts/submit.sh "$HOME/dataset_20261008/split_80_10_10"
+bash scripts/submit.sh "$HOME/dataset_20261011/split_80_10_10"
 ```
 
 Submission checks the dataset, the GSD table and the cached encoder weights
@@ -98,7 +103,7 @@ A variable in front of the command changes the run, for example the
 EfficientNet-B4 encoder:
 
 ```bash
-ENCODER=efficientnet-b4 bash scripts/submit.sh "$HOME/dataset_20261008/split_80_10_10"
+ENCODER=efficientnet-b4 bash scripts/submit.sh "$HOME/dataset_20261011/split_80_10_10"
 ```
 
 All variables are listed in the [server guide](docs/ASL_SETUP.md).

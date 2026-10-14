@@ -81,7 +81,7 @@ The dataset must contain `train/images`, `train/masks`, `val/images`,
 `val/masks`, `test/images`, and `test/masks`.
 
 ```bash
-bash scripts/submit.sh "$HOME/dataset_20261008/split_80_10_10"
+bash scripts/submit.sh "$HOME/dataset_20261011/split_80_10_10"
 ```
 
 That trains the default network: UNet++ on ConvNeXt-Tiny with every
@@ -89,7 +89,7 @@ augmentation on (`all` preset). Core defaults live in `configs/training.toml`.
 CLI flags take precedence. Direct training on an allocated compute node:
 
 ```bash
-python scripts/train.py "$HOME/dataset_20261008/split_80_10_10" --output runs/manual --gsd-csv configs/gsd.csv
+python scripts/train.py "$HOME/dataset_20261011/split_80_10_10" --output runs/manual --gsd-csv configs/gsd.csv
 ```
 
 Default request: ASL-gpu, one GPU, four CPU cores, 32 GB host RAM, two days.
@@ -113,15 +113,16 @@ Variables in front of the command change the run:
 | `INIT_WEIGHTS`, `LEARNING_RATE` | Fine-tune an earlier `best.pt` of this trainer | ImageNet encoder |
 | `LABEL_TOLERANCE` | Pixels around each label left out of the loss | 0 |
 | `SAVE_PREDICTIONS` | Test overlays to save | 40 |
+| `EVALUATE_ONLY` | `1`: score the `best.pt` of an earlier run again, no training (below) | `0` |
 
 The two encoders are two runs, one after the other, with the same augmentation:
 
 ```bash
-bash scripts/submit.sh "$HOME/dataset_20261008/split_80_10_10"
+bash scripts/submit.sh "$HOME/dataset_20261011/split_80_10_10"
 ```
 
 ```bash
-ENCODER=efficientnet-b4 bash scripts/submit.sh "$HOME/dataset_20261008/split_80_10_10"
+ENCODER=efficientnet-b4 bash scripts/submit.sh "$HOME/dataset_20261011/split_80_10_10"
 ```
 
 `TRAIN_ARGS` passes any option of `python scripts/train.py --help` to the job.
@@ -129,7 +130,7 @@ The unmodified network of smp (no hairline stem, no deep supervision) on
 EfficientNet-B4 is:
 
 ```bash
-ENCODER=efficientnet-b4 TRAIN_ARGS="--no-hairline-stem --no-deep-supervision" bash scripts/submit.sh "$HOME/dataset_20261008/split_80_10_10"
+ENCODER=efficientnet-b4 TRAIN_ARGS="--no-hairline-stem --no-deep-supervision" bash scripts/submit.sh "$HOME/dataset_20261011/split_80_10_10"
 ```
 
 To compare with the Swin and FiLM U-Net runs, which used the reference
@@ -142,20 +143,23 @@ without those seven.
 
 By default the best checkpoint and the threshold are chosen on the validation
 images of every source pooled by pixel, which the thick-crack sources dominate.
+Every source family also gets its own threshold, calibrated on its validation
+images, and the test metrics are reported at both (see
+[the thresholds](ARCHITECTURE.md#thresholds)).
 `SELECT_PATTERN` (a regex on validation file names) chooses them on a target
 source instead and samples that source's training images `TARGET_WEIGHT` times
 as often (default 1.5). For the row/column tiles:
 
 ```bash
-SELECT_PATTERN='_r[0-9]+_c[0-9]+' bash scripts/submit.sh "$HOME/dataset_20261008/split_80_10_10"
+SELECT_PATTERN='_r[0-9]+_c[0-9]+' bash scripts/submit.sh "$HOME/dataset_20261011/split_80_10_10"
 ```
 
 Only use `SLURM_ACCOUNT` / `SLURM_PARTITION` values confirmed by the
 administrator. A pending job can show `InvalidAccount` on this server and still
 start on its own. Pending jobs produce no epoch metrics until they start.
 
-The nested decoder is heavier than a U-Net decoder, and neither the time per
-epoch nor the memory use on the ASL GPUs has been measured for this network.
+The first run (ConvNeXt-Tiny, 12,736 training tiles, batch 12) took 210 s per
+epoch on an RTX A6000, 4.7 hours for 80 epochs. Its memory use was not logged;
 `slurm/gpu_check.sbatch` prints the memory of one evaluation tile. Reduce the
 batch size if GPU memory is exhausted (`BATCH_SIZE=8`); if evaluation exhausts
 memory, reduce the tile (`TRAIN_ARGS="--eval-tile 768"`). Early stopping
@@ -207,11 +211,26 @@ the run directory holds:
 
 - `best.pt`, resumable `last.pt`, `configuration.json`, `training_history.csv`,
   `validation_by_source.csv`, `val_threshold_sweep.csv`
-- `test_metrics.json`: pooled, per source and per GSD value
+- `test_metrics.json`: pooled, per source and per GSD value at the shared
+  threshold, and under `with_source_thresholds` with every source at its own
 - `test_predictions/`: for each saved test image the probability map and the
   overlay (yellow = hit, red = false positive, green = missed)
 - `augmentation_counts.json`, `contrast_coverage.json`, `plots/`, and the Git
   commit and package versions of the job
+
+## Score an earlier run again
+
+A run trained before the per-source thresholds existed is scored with them,
+without training, by an evaluation-only job on its run directory:
+
+```bash
+EVALUATE_ONLY=1 GSD_CSV="$HOME/gsd_20261011.csv" bash scripts/submit.sh "$HOME/dataset_20261011/split_80_10_10" "$HOME/unetpp/runs/20261011_212847_430380"
+```
+
+It writes `test_metrics_evaluate_only.json` and the log prints, for every
+source, the validation and test score at the shared threshold and at its own.
+`best.pt`, `test_metrics.json` and the history stay as they were; the figures
+in `plots/` are drawn again.
 
 ## Resume and update
 

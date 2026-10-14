@@ -94,6 +94,45 @@ by the focal loss in both.
 `training_history.csv` records the whole objective (`train_loss`) and the part
 of the network output (`train_output_loss`, the terms `val_loss` has).
 
+## Thresholds
+
+The first run (ConvNeXt-Tiny, the 12,736-tile dataset) showed that one
+threshold cannot serve every source. The shared threshold, calibrated on all
+validation images pooled by pixel, came out at 0.875, because the benchmark
+photos hold most of the labelled crack pixels. The orthomosaic tiles are 71 %
+of the training tiles but hold only 21 % of their labelled crack pixels; their cracks are faint
+and the network is less sure of them, and on validation they scored best at
+0.05, the bottom of the grid:
+
+| Validation source | Tolerant F1 at 0.875 | At its own threshold |
+| --- | --- | --- |
+| RAMA8 faces 3 to 8 (`f#_r#_c#`, 736 images) | 0.284 | 0.350 at 0.05 |
+| RAMA8 west (`rama#_west-...`, 94) | 0.235 | 0.329 at 0.05 |
+| RAMA8 east (`rama#_east-...`, 46) | 0.265 | 0.315 at 0.05 |
+| EH104 (`eh#_r#_c#`, 299) | 0.698 | 0.707 at 0.75 |
+| Benchmark and close-range sets | 0.88 to 0.99 | at most 0.003 higher, 0.825 to 0.95 |
+
+So the trainer now:
+
+- searches thresholds from 0.01 to 0.99 (0.05 to 0.95 in steps of 0.025, and
+  steps of 0.01 beyond);
+- besides the shared threshold, calibrates one threshold per source family on
+  validation, for every family with at least `--source-threshold-min-images`
+  (10) validation images; a smaller family keeps the shared threshold;
+- reports the test metrics both ways in `test_metrics.json`: at the shared
+  threshold as before (`per_source`, `per_gsd`, the pooled values), and under
+  `with_source_thresholds` with every source at its own threshold, pooled and
+  per source;
+- stores the thresholds in `best.pt` (`optimal_threshold`,
+  `source_thresholds` and their `_tta` variants), so a detector run on a
+  facade can use the facade's threshold instead of 0.875.
+
+The thresholds are chosen on validation only, so the test numbers under
+`with_source_thresholds` are as fair as the shared ones. The model and the
+training are unchanged by this: an earlier run is scored the new way with
+`--evaluate-only` (`EVALUATE_ONLY=1` on the server), which writes
+`test_metrics_evaluate_only.json` and leaves the run's other files as they are.
+
 ## Training settings
 
 The settings are those of the other CNN trainers, so that the runs differ in
@@ -134,7 +173,8 @@ training is otherwise the same.
 
 `last.pt` and `best.pt` are written to a temporary file and renamed. `best.pt`
 stores the architecture name and arguments (encoder, decoder options, stems,
-deep supervision), the GSD table and the augmentation configuration, and
+deep supervision), the GSD table, the augmentation configuration and the
+shared and per-source thresholds, and
 `unetpp.models.load_model_from_checkpoint` rebuilds the network from them
 without downloading anything. `--init-weights` and `--resume` need the same
 network as the checkpoint and stop with the differing options otherwise.
@@ -148,4 +188,6 @@ directory with `RESUME=1`. Do not run concurrent jobs into one output folder.
 There is no full-orthomosaic inference for this model yet. A model loaded with
 `load_model_from_checkpoint` is called as `model(images)` with RGB in [0, 1]
 and a height and width that are multiples of 32, and returns the crack logits;
-`checkpoint["optimal_threshold"]` is the threshold calibrated on validation.
+`checkpoint["optimal_threshold"]` is the threshold calibrated on validation,
+and `checkpoint["source_thresholds"]` maps every source family (for example
+`f#_r#_c#`, the RAMA8 face tiles) to its own.

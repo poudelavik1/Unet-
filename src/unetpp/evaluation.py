@@ -95,6 +95,33 @@ def at_threshold(metrics: dict[str, np.ndarray], index: int) -> dict[str, float]
     return {name: float(metrics[name][index]) for name in METRIC_NAMES}
 
 
+def source_threshold_indices(sweep: ThresholdSweep, domain_ids, metric: str, images: dict, minimum_images: int,
+                             fallback: int) -> dict[int, int]:
+    """Each source's own best threshold on `metric`, as an index into the sweep's thresholds.
+
+    One threshold serves the sources badly: on the first UNet++ run the benchmark photos (thick,
+    high-contrast cracks) scored best near 0.9 and the orthomosaic tiles (faint hairlines) at the
+    bottom of the grid, so the shared threshold (0.875) cost the tiles 0.05 to 0.09 tolerant F1. A
+    source with fewer than `minimum_images` images (`images[domain]`) or no labelled pixel keeps
+    the shared threshold `fallback`: its own optimum would be noise.
+    """
+    labelled = COUNT_NAMES.index("labelled")
+    chosen = {}
+    for domain in domain_ids:
+        counts = sweep.count_array([domain])
+        if images.get(domain, 0) < minimum_images or counts[0, labelled] <= 0:
+            chosen[domain] = fallback
+        else:
+            chosen[domain] = int(np.argmax(metrics_from_counts(counts)[metric]))
+    return chosen
+
+
+def counts_at_indices(sweep: ThresholdSweep, indices: dict[int, int]) -> np.ndarray:
+    """Pixel counts summed over sources, each at its own threshold index: array (1, len(COUNT_NAMES))."""
+    rows = [sweep.count_array([domain])[index] for domain, index in indices.items()]
+    return np.sum(rows, axis=0, keepdims=True) if rows else np.zeros((1, len(COUNT_NAMES)))
+
+
 def tile_origins(length: int, tile: int, stride: int) -> list[int]:
     """Offsets of tiles of size `tile` covering `length`; the last one ends flush with the edge."""
     if length <= tile:
@@ -225,6 +252,7 @@ def prediction_writer(dataset, directory: Path, limit: int, threshold: float):
 
 __all__ = [
     'ThresholdSweep', 'metrics_from_counts', 'basic_metrics', 'confusion_from_counts', 'at_threshold',
+    'source_threshold_indices', 'counts_at_indices',
     'tile_origins', 'predict_logits', 'predict_probabilities', 'evaluate',
     'spread_over_sources', 'prediction_writer',
 ]

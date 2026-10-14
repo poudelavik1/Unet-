@@ -9,9 +9,13 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 try:
+    import numpy as np
     import torch
     import segmentation_models_pytorch as smp
-    from unetpp.evaluation import prediction_writer, spread_over_sources
+    from unetpp.evaluation import (
+        ThresholdSweep, counts_at_indices, metrics_from_counts, prediction_writer, source_threshold_indices,
+        spread_over_sources,
+    )
     from unetpp.losses import FocalCrackLoss, HairlineCrackLoss
     from unetpp.models import UNetPlusPlus, load_model_from_checkpoint
     from unetpp.self_test import run_self_tests
@@ -76,6 +80,25 @@ class TrainingTests(unittest.TestCase):
         self.assertEqual(per_source, [19, 18, 3])  # the small source is saved whole, the rest shared
         self.assertGreater(max(index for index in chosen if domain_ids[index] == 0), 250)  # not just the first files
         self.assertEqual(spread_over_sources(domain_ids, 10**6), set(range(len(domain_ids))))  # a large limit saves all
+
+    def test_every_source_gets_its_own_threshold(self):
+        # Source 0 is predicted confidently, source 1 (faint cracks) only weakly, source 2 has few images.
+        thresholds = [0.05, 0.25, 0.5, 0.75, 0.95]
+        sweep = ThresholdSweep(thresholds, 0, 3, 'cpu')
+        target = torch.zeros(1, 1, 8, 8)
+        target[..., 2:4, :] = 1
+        strong, weak = target * 0.6 + 0.3, target * 0.1 + 0.02  # crack 0.9 on background 0.3; 0.12 on 0.02
+        for probability, domain in ((strong, 0), (weak, 1), (weak, 2)):
+            sweep.update(probability, target, torch.ones_like(target), torch.tensor([domain]))
+        images = {0: 40, 1: 40, 2: 3}
+        chosen = source_threshold_indices(sweep, [0, 1, 2], 'f1', images, 10, fallback=2)
+        self.assertEqual(chosen, {0: 2, 1: 0, 2: 2})  # above its background; the lowest; three images: shared
+        combined = counts_at_indices(sweep, chosen)
+        expected = sum(sweep.count_array([domain])[index] for domain, index in chosen.items())
+        self.assertTrue(np.array_equal(combined[0], expected))
+        metrics = metrics_from_counts(combined)
+        self.assertAlmostEqual(float(metrics['recall'][0]), 2 / 3, places=4)  # the small source is missed at 0.5
+        self.assertAlmostEqual(float(metrics['precision'][0]), 1.0, places=4)
 
     def test_overlays_are_written_for_the_selected_images_only(self):
         class Tiles:  # the parts of CrackSegmentationDataset the writer reads
