@@ -49,6 +49,12 @@ convolution are smp's. Three things are added, each with a switch:
 With EfficientNet and the last two switched off, the network is
 `smp.UnetPlusPlus` itself, weight for weight.
 
+`--loss` takes one or more loss terms (BCE, focal, Dice, Tversky, clDice) and
+`--optimizer` AdamW or Adam. `scripts/submit_ablation.sh` trains every
+combination of the two optimisers and five losses on the server, and
+`scripts/compare_runs.py` draws all runs in one set of comparison figures
+([the study](docs/ARCHITECTURE.md#optimiser-and-loss-study)).
+
 Every source family also gets its own validation-calibrated threshold next to
 the shared one: on the first run the facade tiles scored best near 0.05 while
 the shared threshold was 0.875. Both are reported and stored in `best.pt`

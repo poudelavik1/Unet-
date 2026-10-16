@@ -6,7 +6,8 @@
 configs/training.toml         Core training defaults
 configs/gsd.csv               GSD (mm per pixel) of each source
 src/unetpp/                   Augmentation, data, models, losses, evaluation, plots, training
-scripts/                      Conda setup, encoder weights, submission, training CLI, epoch monitor
+scripts/                      Conda setup, encoder weights, submission, training CLI, epoch monitor,
+                              optimiser and loss study, comparison figures
 slurm/train_unetpp.sbatch     ASL CUDA training job
 slurm/gpu_check.sbatch        Ten-minute GPU, environment and network check
 docs/ARCHITECTURE.md          Encoder, nested decoder, stems and deep supervision
@@ -106,7 +107,8 @@ Variables in front of the command change the run:
 | `EPOCHS`, `BATCH_SIZE`, `WORKERS` | Core settings | `configs/training.toml` (80, 12, 4) |
 | `ENCODER` | Any smp encoder: `tu-convnext_tiny`, `tu-convnext_small`, `efficientnet-b4`, `efficientnet-b5`, ... | `tu-convnext_tiny` |
 | `AUG_PRESET` | `all`, `heavy`, `medium`, `light`, `reference`, `none` | `all` |
-| `LOSS` | `hairline` (BCE + Tversky + clDice) or `focal` | `hairline` |
+| `OPTIMIZER` | `adamw` or `adam` | `adamw` |
+| `LOSS` | Loss terms, separated by spaces: `bce`, `focal`, `dice`, `tversky`, `cldice`, or `hairline` (BCE + Tversky + clDice) | `hairline` |
 | `TRAIN_ARGS` | Further trainer options, in one quoted string | none |
 | `GSD_CSV` | GSD table (data pipeline and reports only) | `configs/gsd.csv` |
 | `SELECT_PATTERN`, `TARGET_WEIGHT` | Select the model and threshold on one source | all sources |
@@ -217,6 +219,55 @@ the run directory holds:
   overlay (yellow = hit, red = false positive, green = missed)
 - `augmentation_counts.json`, `contrast_coverage.json`, `plots/`, and the Git
   commit and package versions of the job
+
+## Optimiser and loss study
+
+One command trains every combination of optimiser (AdamW, Adam) and loss (BCE,
+Focal, Dice, Tversky, and BCE + Tversky + clDice): ten runs, one job after
+another, because ASL has removed a second job of the same user from the queue.
+It runs on the login node in the background and keeps going after you log out:
+
+```bash
+cd ~/unetpp && nohup bash scripts/submit_ablation.sh "$HOME/dataset_20261011/split_80_10_10" > logs/ablation.log 2>&1 &
+```
+
+Follow it with:
+
+```bash
+tail -f ~/unetpp/logs/ablation.log
+```
+
+The runs go to `runs/ablation/<optimizer>_<loss>`. At about 4.8 hours per run
+the study takes about two days; `EPOCHS=40` in front of the command halves
+that (every run then has 40 epochs, so they stay comparable with each other but
+not with the 80-epoch runs). When the last run has ended, the script draws the
+comparison into `runs/ablation/comparison/`. A finished run is skipped and an
+interrupted one resumed, so the same command continues the study after a
+failure. `OPTIMIZERS="adam"` or `LOSSES="dice tversky"` limit it; terms joined
+with `+` make a combined loss (`LOSSES="dice+cldice"`).
+
+The AdamW run with the default loss is the run you already have. To reuse it
+instead of training it again, link it into the study before starting:
+
+```bash
+mkdir -p ~/unetpp/runs/ablation && ln -s "$(ls -d ~/unetpp/runs/2*/ | sort | tail -1)" ~/unetpp/runs/ablation/adamw_hairline
+```
+
+That links the newest run in `runs/`; check with `ls -l ~/unetpp/runs/ablation`
+that it is the one you mean.
+
+The comparison can be drawn again at any time, also from runs that are still
+missing (they are left out):
+
+```bash
+cd ~/unetpp && python scripts/compare_runs.py runs/ablation --output runs/ablation/comparison
+```
+
+Download the figures and tables (PowerShell on your PC):
+
+```powershell
+scp -P 44065 -r se-st126157@asl.ait.ac.th:unetpp/runs/ablation/comparison "E:\STRUCTURAL ENGINEERING\thesis\crackdetection\training\runsunetpp"
+```
 
 ## Score an earlier run again
 

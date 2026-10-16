@@ -35,6 +35,19 @@ done < <(tail -n +2 "$GSD_CSV" | tr -d '\r' | grep -vE '^[[:space:]]*(#|$)')
 ENCODER="${ENCODER:-tu-convnext_tiny}"
 export ENCODER
 echo "Encoder: $ENCODER"
+# A wrong optimiser or loss term would only fail after the queue wait.
+case "${OPTIMIZER:-adamw}" in
+    adamw|adam) ;;
+    *) echo "OPTIMIZER takes adamw or adam, not: $OPTIMIZER" >&2; exit 1 ;;
+esac
+for term in ${LOSS:-hairline}; do
+    case "$term" in
+        bce|focal|dice|tversky|cldice|hairline) ;;
+        *) echo "LOSS takes bce, focal, dice, tversky, cldice or hairline, separated by spaces; not: $term" >&2
+           exit 1 ;;
+    esac
+done
+echo "Optimizer: ${OPTIMIZER:-adamw} | loss: ${LOSS:-hairline}"
 if [[ "${RESUME:-0}" != 1 && "${EVALUATE_ONLY:-0}" != 1 && -z "${INIT_WEIGHTS:-}" ]]; then
     # Compute nodes may lack internet, so the pretrained encoder must already be in the cache.
     # Checked as the job will load it: with the environment's Python and the Hugging Face Hub offline.

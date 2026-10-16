@@ -13,13 +13,16 @@ sampling distance.
 | `src/unetpp/augmentations.py` | Reference augmentation, extended library, label safety, presets |
 | `src/unetpp/data.py` | Image/mask pairing, dataset with GSD bookkeeping, augmentation preview, batching |
 | `src/unetpp/models.py` | `UNetPlusPlus` (smp encoder and nested decoder, stems, deep supervision), EMA, checkpoint reconstruction |
-| `src/unetpp/losses.py` | BCE, Tversky, clDice, focal loss, with deep-supervision terms |
+| `src/unetpp/losses.py` | The loss terms (BCE, focal, Dice, Tversky, clDice) and their weighted sum, with deep-supervision terms |
 | `src/unetpp/evaluation.py` | Threshold sweeps, tiled inference, tolerant metrics, predictions |
 | `src/unetpp/plots.py` | Epoch curves and final evaluation figures/tables |
+| `src/unetpp/comparison.py` | Figures and tables comparing finished runs (the optimiser and loss study) |
 | `src/unetpp/training.py` | Argument parsing, optimizer/scheduler, training/validation, resume |
 | `src/unetpp/self_test.py` | The trainer's built-in checks (`--self-test`) |
 | `scripts/train.py` | TOML defaults and training CLI |
 | `scripts/encoder_weights.py` | Cache the pretrained encoder, or check that it is cached |
+| `scripts/submit_ablation.sh` | Train every optimiser and loss combination, one job after another |
+| `scripts/compare_runs.py` | Draw finished runs in one set of comparison figures |
 | `slurm/train_unetpp.sbatch` | ASL GPU allocation and execution |
 
 `augmentations.py`, `data.py` and `gsd.py` are unchanged copies of the
@@ -83,13 +86,24 @@ model and compare the outputs.
 ## Loss
 
 ```text
-loss = L(output, mask)                                    BCE + Tversky + clDice
-     + sum over X(0,1..3) of  w_k * R(deep output k, mask)   BCE + Tversky
+loss = L(output, mask)                                    the --loss terms
+     + sum over X(0,1..3) of  w_k * R(deep output k, mask)   its region terms (all but clDice)
 ```
 
-`L` is the reference loss of the other projects and `R` its region term.
-`w_k` is `--aux-weights` (0.2 for each). `--loss focal` replaces BCE + Tversky
-by the focal loss in both.
+`--loss` names one or more terms, added with their `--<term>-weight`:
+
+| Term | What it measures | Weight |
+| --- | --- | --- |
+| `bce` | Binary cross-entropy per pixel | 1 |
+| `focal` | Binary focal loss: cross-entropy turned down on pixels already right (alpha 0.25, gamma 2) | 1 |
+| `dice` | 1 - soft Dice over the batch | 1 |
+| `tversky` | 1 - Tversky index, misses weighted 0.6 and false positives 0.4 | 1 |
+| `cldice` | Soft clDice: continuity of the crack centreline, ramped in over 5 epochs | 0.5 |
+
+The default, `hairline`, is BCE + Tversky + clDice, the loss of the other
+projects. `w_k` is `--aux-weights` (0.2 for each). clDice alone is not a
+usable loss: a prediction of crack everywhere has an empty soft skeleton and
+scores 0, so it only makes sense next to a region term.
 
 `training_history.csv` records the whole objective (`train_loss`) and the part
 of the network output (`train_output_loss`, the terms `val_loss` has).
@@ -132,6 +146,40 @@ The thresholds are chosen on validation only, so the test numbers under
 training are unchanged by this: an earlier run is scored the new way with
 `--evaluate-only` (`EVALUATE_ONLY=1` on the server), which writes
 `test_metrics_evaluate_only.json` and leaves the run's other files as they are.
+
+## Optimiser and loss study
+
+To show what the optimiser and the loss contribute, `scripts/submit_ablation.sh`
+trains one run per combination, all with the same network, data, augmentation
+and schedule:
+
+| | BCE | Focal | Dice | Tversky | BCE + Tversky + clDice |
+| --- | --- | --- | --- | --- | --- |
+| AdamW | run | run | run | run | run (the default) |
+| Adam | run | run | run | run | run |
+
+AdamW decays the weights separately from the gradient step; Adam adds the
+weight decay (1e-4) to the gradient as L2 regularisation. Both use the same
+learning rates. Each run trains on the loss named in its column alone, on the
+network output and on the deep-supervision outputs.
+
+`scripts/compare_runs.py` reads the finished runs and writes, to
+`runs/ablation/comparison/`:
+
+- `comparison_test_metrics.png`: tolerant F1, F1 and IoU on the test set, one
+  row per loss and one dot per optimiser (AdamW blue, Adam orange);
+- `comparison_heatmap.png`: the same runs as an optimiser x loss grid of
+  tolerant F1 and F1, every value written in its cell;
+- `comparison_validation_curves.png`: validation tolerant F1 per epoch, one
+  panel per loss, both optimisers in each;
+- `comparison_precision_recall.png`: tolerant precision against recall, with
+  curves of equal tolerant F1, which shows what each loss trades between the two;
+- `comparison_summary.csv` (every metric, the tolerant F1 at the per-source
+  thresholds and per source) and `comparison_summary.md` (a table to paste).
+
+Every run is evaluated at its own validation-calibrated threshold, so a loss
+that gives lower probabilities is not penalised by a threshold set for another.
+The loss values themselves are not compared: the terms have different scales.
 
 ## Training settings
 

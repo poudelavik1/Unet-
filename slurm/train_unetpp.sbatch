@@ -57,7 +57,11 @@ args=("$DATASET" --output "$OUTPUT_DIR")
 [[ -z "${ENCODER:-}" ]] || args+=(--encoder "$ENCODER")
 [[ -z "${GSD_CSV:-}" ]] || args+=(--gsd-csv "$GSD_CSV")
 [[ -z "${AUG_PRESET:-}" ]] || args+=(--aug-preset "$AUG_PRESET")
-[[ -z "${LOSS:-}" ]] || args+=(--loss "$LOSS")
+[[ -z "${OPTIMIZER:-}" ]] || args+=(--optimizer "$OPTIMIZER")
+if [[ -n "${LOSS:-}" ]]; then
+    read -ra loss <<< "$LOSS"                  # "bce tversky" -> two arguments
+    args+=(--loss "${loss[@]}")
+fi
 if [[ -n "${TRAIN_ARGS:-}" ]]; then
     read -ra extra <<< "$TRAIN_ARGS"           # further trainer options: "--no-hairline-stem --no-deep-supervision"
     args+=("${extra[@]}")

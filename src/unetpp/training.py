@@ -47,12 +47,24 @@ The network (``UNetPlusPlus``) is the UNet++ of segmentation_models_pytorch
 * ``forward(images)``: eval mode returns the crack logits (N, 1, H, W). Train
   mode returns ``(logits, auxiliary)`` with the deep-supervision logits.
 
-Loss: the reference loss (BCE + recall-leaning Tversky + clDice with warm-up)
-on the network output, plus ``--aux-weights`` (0.2 each) times BCE + Tversky
-on the three deep-supervision outputs. ``--loss focal`` replaces BCE + Tversky
-by the binary focal loss everywhere. ``training_history.csv`` has the whole
-objective as ``train_loss`` and the part of the network output as
-``train_output_loss`` (the terms ``val_loss`` has).
+Loss (``--loss``): one or more of the terms ``bce`` (binary cross-entropy),
+``focal`` (binary focal loss), ``dice``, ``tversky`` (recall-leaning, false
+positives 0.4 and misses 0.6) and ``cldice`` (centreline continuity, with
+warm-up), added with their ``--<term>-weight``. The default, ``hairline``, is
+the loss of the other hairline trainers: BCE + Tversky + clDice. The terms
+apply to the network output; the three deep-supervision outputs get
+``--aux-weights`` (0.2 each) times the region terms (all but clDice). clDice
+alone is not a usable loss: a prediction of crack everywhere has an empty
+soft skeleton and scores 0. ``training_history.csv`` has the whole objective
+as ``train_loss`` and the part of the network output as ``train_output_loss``
+(the terms ``val_loss`` has). The loss values of runs with different terms
+are on different scales and are not compared; their metrics are.
+
+Optimiser and loss study: ``scripts/submit_ablation.sh`` trains one run per
+combination of ``--optimizer`` (AdamW, Adam) and ``--loss`` (each single
+region term and the combined loss), one job after another, and
+``scripts/compare_runs.py`` draws all of them in one set of comparison
+figures (``unetpp.comparison``).
 
 Thresholds: the threshold of the network output is calibrated on validation
 with ``--select-metric`` (the 2-px tolerant F1) on a grid from 0.01 to 0.99.
@@ -269,7 +281,7 @@ from .data import (
     CrackSegmentationDataset, collect_pairs, save_augmentation_preview, shape_grouped_batches, source_family,
 )
 from .models import ARCHITECTURES, ModelEMA, different_arguments
-from .losses import FocalCrackLoss, HairlineCrackLoss
+from .losses import LOSS_ALIASES, LOSS_TERMS, CrackLoss, loss_label, loss_terms
 from .evaluation import (
     ThresholdSweep, at_threshold, basic_metrics, counts_at_indices, evaluate, metrics_from_counts, prediction_writer,
     source_threshold_indices,
@@ -493,13 +505,17 @@ def parse_arguments():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=0 if os.name == "nt" else min(4, os.cpu_count() or 1))
     # Loss
-    parser.add_argument("--loss", choices=("hairline", "focal"), default="hairline",
-                        help="hairline: BCE + Tversky + clDice (default, as the reference). focal: binary "
-                             "focal loss + the same clDice term. The deep-supervision outputs use the same "
-                             "region term, without clDice")
-    parser.add_argument("--focal-alpha", type=float, default=0.25, help="--loss focal: weight of the crack class")
-    parser.add_argument("--focal-gamma", type=float, default=2.0, help="--loss focal: focusing exponent")
+    parser.add_argument("--loss", nargs="+", choices=(*LOSS_TERMS, *LOSS_ALIASES), default=["hairline"],
+                        metavar="TERM",
+                        help="Loss terms, added with their --<term>-weight: bce, focal, dice, tversky, cldice. "
+                             "hairline = bce tversky cldice, the loss of the other trainers (default). One term "
+                             "alone, e.g. '--loss dice', trains on that loss only. The deep-supervision outputs "
+                             "get the region terms, without clDice")
+    parser.add_argument("--focal-alpha", type=float, default=0.25, help="focal term: weight of the crack class")
+    parser.add_argument("--focal-gamma", type=float, default=2.0, help="focal term: focusing exponent")
     parser.add_argument("--bce-weight", type=float, default=1.0)
+    parser.add_argument("--focal-weight", type=float, default=1.0)
+    parser.add_argument("--dice-weight", type=float, default=1.0)
     parser.add_argument("--tversky-weight", type=float, default=1.0)
     parser.add_argument("--cldice-weight", type=float, default=0.5)
     parser.add_argument("--cldice-warmup-epochs", type=int, default=5,
@@ -613,6 +629,7 @@ def parse_arguments():
         parser.error("--drop-path-rate must lie in [0, 1).")
     if min(args.aux_weights) < 0:
         parser.error("--aux-weights must not be negative.")
+    args.loss = list(loss_terms(args.loss))  # aliases expanded: configuration.json lists the terms
     if args.image_size % 32:
         parser.error("--image-size must be divisible by 32 (the encoder halves the image five times).")
     if args.eval_tile % 32 or not 0 <= args.eval_tile_overlap < max(1, args.eval_tile):
@@ -797,15 +814,12 @@ def main():
         args.epochs * steps_per_epoch, int(args.warmup_epochs * steps_per_epoch), args.min_lr_ratio
     ))
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    if args.loss == "focal":
-        loss_function = FocalCrackLoss(args.focal_alpha, args.focal_gamma, args.cldice_weight,
-                                       args.skeleton_iterations, args.aux_weights, args.label_tolerance)
-    else:
-        loss_function = HairlineCrackLoss(
-            args.bce_weight, args.tversky_weight, args.cldice_weight,
-            args.false_positive_weight, args.false_negative_weight,
-            args.skeleton_iterations, args.aux_weights, args.label_tolerance,
-        )
+    loss_function = CrackLoss(
+        args.loss, {"bce": args.bce_weight, "focal": args.focal_weight, "dice": args.dice_weight,
+                    "tversky": args.tversky_weight, "cldice": args.cldice_weight},
+        args.false_positive_weight, args.false_negative_weight, args.focal_alpha, args.focal_gamma,
+        args.skeleton_iterations, args.aux_weights, args.label_tolerance,
+    )
     # 0.05 to 0.95 in steps of 0.025, and 0.01 steps beyond: on the first run the orthomosaic tiles scored
     # best at 0.05 and the benchmark photos at 0.95, the ends of the grid of the earlier trainers.
     thresholds = np.round(np.concatenate((np.arange(0.01, 0.045, 0.01), np.arange(0.05, 0.951, 0.025),
@@ -826,6 +840,13 @@ def main():
           f"decoder channels {' '.join(str(channels) for channels in kwargs['decoder_channels'])}, "
           f"attention {kwargs['decoder_attention'] or 'none'}; "
           + (f"added to smp's network: {', '.join(added)}." if added else "smp.UnetPlusPlus, nothing added."))
+    if not args.evaluate_only:
+        print(f"Loss: {loss_label(args.loss)} (weights "
+              + ", ".join(f"{term} {weight:g}" for term, weight in loss_function.weights.items())
+              + f") | optimiser: {'AdamW' if args.optimizer == 'adamw' else 'Adam'}, learning rate "
+              f"{args.learning_rate:g} (encoder x {args.encoder_lr_factor:g}), weight decay {args.weight_decay:g}.")
+        if args.loss == ["cldice"]:
+            print("Warning: clDice alone has its minimum at a prediction of crack everywhere; expect a useless model.")
     if train_set.contrast_factors is not None:
         factors = train_set.contrast_factors
         print(f"Contrast: all {len(factors)} levels from {100 * (factors[0] - 1):+.0f} % to "
